@@ -50,10 +50,8 @@ import com.helger.phoss.smp.domain.pmigration.EParticipantMigrationState;
 import com.helger.phoss.smp.smlsync.SMLFirstPage;
 import com.helger.phoss.smp.domain.pmigration.ISMPParticipantMigration;
 import com.helger.phoss.smp.domain.pmigration.ISMPParticipantMigrationManager;
+import com.helger.phoss.smp.domain.pmigration.SMPInboundMigrationHelper;
 import com.helger.phoss.smp.domain.pmigration.SMPParticipantMigration;
-import com.helger.phoss.smp.domain.servicegroup.ISMPServiceGroup;
-import com.helger.phoss.smp.domain.servicegroup.ISMPServiceGroupManager;
-import com.helger.phoss.smp.domain.sgprops.SGCustomPropertyList;
 import com.helger.phoss.smp.settings.ISMPSettings;
 import com.helger.phoss.smp.smlhook.SmpSmlHelper;
 import com.helger.phoss.smp.ui.AbstractSMPWebPageForm;
@@ -258,17 +256,13 @@ public final class PageSecureServiceGroupMigrationInbound extends AbstractSMPWeb
                                                  @NonNull final FormErrorList aFormErrors,
                                                  @NonNull final EWebPageFormAction eFormAction)
   {
-    final ISMPServiceGroupManager aServiceGroupMgr = SMPMetaManager.getServiceGroupMgr ();
     final IIdentifierFactory aIdentifierFactory = SMPMetaManager.getIdentifierFactory ();
     final ISMPSettings aSettings = SMPMetaManager.getSettings ();
-    final ISMPParticipantMigrationManager aParticipantMigrationMgr = SMPMetaManager.getParticipantMigrationMgr ();
 
     final String sMigrationKey = aWPEC.params ().getAsStringTrimmed (FIELD_MIGRATION_KEY);
     final String sParticipantIDScheme = aWPEC.params ().getAsStringTrimmed (FIELD_PARTICIPANT_ID_SCHEME);
     final String sParticipantIDValue = aWPEC.params ().getAsStringTrimmed (FIELD_PARTICIPANT_ID_VALUE);
     IParticipantIdentifier aParticipantID = null;
-    boolean bParticipantSourceIsThisSMP = false;
-    String sOutboundMigrationID = null;
     final String sOwningUserID = aWPEC.params ().getAsStringTrimmed (FIELD_OWNING_USER_ID);
     final IUser aOwningUser = PhotonSecurityManager.getUserMgr ().getUserOfID (sOwningUserID);
     final String sExtension = aWPEC.params ().getAsStringTrimmed (FIELD_EXTENSION);
@@ -292,27 +286,9 @@ public final class PageSecureServiceGroupMigrationInbound extends AbstractSMPWeb
         if (aParticipantID == null)
           aFormErrors.addFieldError (FIELD_PARTICIPANT_ID_VALUE, "The provided participant ID has an invalid syntax!");
         else
-          if (aServiceGroupMgr.getSMPServiceGroupOfID (aParticipantID) != null)
-          {
-            // There is an edge case, when a participant is migrated from this SMP to this SMP.
-            // So show the error only, if no outbound migration for the participant is present.
-            if (aParticipantMigrationMgr.containsOutboundMigrationInProgress (aParticipantID))
-            {
-              bParticipantSourceIsThisSMP = true;
-              final IParticipantIdentifier aFinalParticipantID = aParticipantID;
-              // TODO create a specific API for that
-              final ISMPParticipantMigration aOutboundMigration = aParticipantMigrationMgr.getAllOutboundParticipantMigrations (EParticipantMigrationState.IN_PROGRESS)
-                                                                                          .findFirst (x -> x.getParticipantIdentifier ()
-                                                                                                            .hasSameContent (aFinalParticipantID));
-              sOutboundMigrationID = aOutboundMigration == null ? null : aOutboundMigration.getID ();
-              LOGGER.info ("The inbound participant migration is for a participant from this SMP (Migration ID '" +
-                           sOutboundMigrationID +
-                           "')!");
-            }
-            else
-              aFormErrors.addFieldError (FIELD_PARTICIPANT_ID_VALUE,
-                                         "Another service group for the same participant ID is already present (may be case insensitive)!");
-          }
+          if (!SMPInboundMigrationHelper.canMigrateInbound (aParticipantID))
+            aFormErrors.addFieldError (FIELD_PARTICIPANT_ID_VALUE,
+                                       "Another service group for the same participant ID is already present (may be case insensitive)!");
       }
 
     if (StringHelper.isEmpty (sOwningUserID))
@@ -373,34 +349,13 @@ public final class PageSecureServiceGroupMigrationInbound extends AbstractSMPWeb
 
     if (aFormErrors.isEmpty ())
     {
-      // Now create the service group locally (it was already checked that the
-      // PID is available on this SMP)
-      ISMPServiceGroup aSG = null;
-      Exception aCaughtEx = null;
-      if (bParticipantSourceIsThisSMP)
+      final SMPInboundMigrationHelper.Result aResult = SMPInboundMigrationHelper.migrateInboundLocally (aParticipantID,
+                                                                                                      sMigrationKey,
+                                                                                                      aOwningUser.getID (),
+                                                                                                      sExtension);
+      if (!aResult.isParticipantSourceThisSMP ())
       {
-        // Special case - existing migration from this SMP to this SMP
-        aSG = aServiceGroupMgr.getSMPServiceGroupOfID (aParticipantID);
-      }
-      else
-      {
-        try
-        {
-          // Do NOT create in SMK/SML
-          final SGCustomPropertyList aCustomProperties = null;
-          final boolean bCreateInSML = false;
-          aSG = aServiceGroupMgr.createSMPServiceGroup (aOwningUser.getID (),
-                                                        aParticipantID,
-                                                        sExtension,
-                                                        aCustomProperties,
-                                                        bCreateInSML);
-        }
-        catch (final Exception ex)
-        {
-          aCaughtEx = ex;
-        }
-
-        if (aSG != null)
+        if (aResult.getServiceGroup () != null)
         {
           aRedirectNotes.addChild (success ("The new SMP Service Group for participant '" +
                                             aParticipantID.getURIEncoded () +
@@ -410,12 +365,11 @@ public final class PageSecureServiceGroupMigrationInbound extends AbstractSMPWeb
         {
           aRedirectNotes.addChild (error ("Error creating the new SMP Service Group for participant '" +
                                           aParticipantID.getURIEncoded () +
-                                          "'.").addChild (SMPCommonUI.getTechnicalDetailsUI (aCaughtEx)));
+                                          "'.").addChild (SMPCommonUI.getTechnicalDetailsUI (aResult.getServiceGroupException ())));
         }
       }
 
-      // Remember internally
-      if (aParticipantMigrationMgr.createInboundParticipantMigration (aParticipantID, sMigrationKey) != null)
+      if (aResult.getMigration () != null)
       {
         aRedirectNotes.addChild (success ().addChild (div ("The participant migration for '" +
                                                            aParticipantID.getURIEncoded () +
@@ -430,15 +384,12 @@ public final class PageSecureServiceGroupMigrationInbound extends AbstractSMPWeb
                                         "'."));
       }
 
-      if (sOutboundMigrationID != null)
+      if (aResult.isParticipantSourceThisSMP ())
       {
-        // Special case - existing migration from this SMP to this SMP
-        // Also immediately close the outbound migration
-        if (aParticipantMigrationMgr.setParticipantMigrationState (sOutboundMigrationID,
-                                                                   EParticipantMigrationState.MIGRATED).isChanged ())
+        if (aResult.isOutboundMigrationFinalized ())
         {
           aRedirectNotes.addChild (success ("The outbound Participant Migration with ID '" +
-                                            sOutboundMigrationID +
+                                            aResult.getOutboundMigrationID () +
                                             "' for '" +
                                             aParticipantID.getURIEncoded () +
                                             "' was successfully finalized!"));
@@ -446,7 +397,7 @@ public final class PageSecureServiceGroupMigrationInbound extends AbstractSMPWeb
         else
         {
           aRedirectNotes.addChild (error ("Failed to finalize the outbound Participant Migration with ID '" +
-                                          sOutboundMigrationID +
+                                          aResult.getOutboundMigrationID () +
                                           "' for '" +
                                           aParticipantID.getURIEncoded () +
                                           "'. Please see the logs for details."));
