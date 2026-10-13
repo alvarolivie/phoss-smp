@@ -33,7 +33,6 @@ import com.helger.peppolid.IParticipantIdentifier;
 import com.helger.peppolid.factory.IIdentifierFactory;
 import com.helger.phoss.smp.config.SMPServerConfiguration;
 import com.helger.phoss.smp.domain.SMPMetaManager;
-import com.helger.phoss.smp.domain.pmigration.EParticipantMigrationDirection;
 import com.helger.phoss.smp.domain.pmigration.EParticipantMigrationState;
 import com.helger.phoss.smp.domain.pmigration.ISMPParticipantMigration;
 import com.helger.phoss.smp.domain.pmigration.ISMPParticipantMigrationManager;
@@ -110,15 +109,28 @@ public final class APIExecutorMigrationInboundFromPathPut extends AbstractSMPAPI
       throw SMPBadRequestException.failedToParseSG (sServiceGroupID, aDataProvider.getCurrentURI ());
     }
 
-    // A Service Group of this SMP may only be migrated if an outbound migration is in progress
-    final boolean bFromThisSMP = aServiceGroupMgr.containsSMPServiceGroupWithID (aParticipantID);
-    final ISMPParticipantMigration aOutboundMigration = aParticipantMigrationMgr.getParticipantMigrationOfParticipantID (EParticipantMigrationDirection.OUTBOUND,
-                                                                                                                          EParticipantMigrationState.IN_PROGRESS,
-                                                                                                                          aParticipantID);
-    if (bFromThisSMP && aOutboundMigration == null)
+    // Check that service group does not exist yet
+    boolean bParticipantSourceIsThisSMP = false;
+    String sOutboundMigrationID = null;
+    if (aServiceGroupMgr.containsSMPServiceGroupWithID (aParticipantID))
     {
-      throw new SMPBadRequestException ("The Service Group '" + sServiceGroupID + "' already exists.",
-                                        aDataProvider.getCurrentURI ());
+      // There is an edge case, when a participant is migrated from this SMP to this SMP.
+      // So show the error only, if no outbound migration for the participant is present.
+      if (aParticipantMigrationMgr.containsOutboundMigrationInProgress (aParticipantID))
+      {
+        bParticipantSourceIsThisSMP = true;
+        final ISMPParticipantMigration aOutboundMigration = aParticipantMigrationMgr.getAllOutboundParticipantMigrations (EParticipantMigrationState.IN_PROGRESS)
+                                                                                    .findFirst (x -> x.getParticipantIdentifier ()
+                                                                                                      .hasSameContent (aParticipantID));
+        sOutboundMigrationID = aOutboundMigration == null ? null : aOutboundMigration.getID ();
+        LOGGER.info (sLogPrefix +
+                     "The inbound participant migration is for a participant from this SMP (Migration ID '" +
+                     sOutboundMigrationID +
+                     "')!");
+      }
+      else
+        throw new SMPBadRequestException ("The Service Group '" + sServiceGroupID + "' already exists.",
+                                          aDataProvider.getCurrentURI ());
     }
 
     if (false)
@@ -163,45 +175,48 @@ public final class APIExecutorMigrationInboundFromPathPut extends AbstractSMPAPI
     // PID is available on this SMP)
     ISMPServiceGroup aSG = null;
     Exception aCaughtEx = null;
-    try
+    if (bParticipantSourceIsThisSMP)
     {
-      // Do not allow any Extension here
-      // Do NOT create in SMK/SML
-      final String sExtension = null;
-      final SGCustomPropertyList aCustomProperties = null;
-      final boolean bCreateInSML = false;
-      aSG = bFromThisSMP ? aServiceGroupMgr.getSMPServiceGroupOfID (aParticipantID)
-                         : aServiceGroupMgr.createSMPServiceGroup (aOwningUser.getID (),
-                                                                   aParticipantID,
-                                                                   sExtension,
-                                                                   aCustomProperties,
-                                                                   bCreateInSML);
-    }
-    catch (final Exception ex)
-    {
-      aCaughtEx = ex;
-    }
-
-    if (aSG != null)
-    {
-      LOGGER.info (sLogPrefix +
-                   "The new SMP Service Group for participant '" +
-                   aParticipantID.getURIEncoded () +
-                   "' was successfully created.");
+      // Special case - existing migration from this SMP to this SMP
+      aSG = aServiceGroupMgr.getSMPServiceGroupOfID (aParticipantID);
     }
     else
     {
-      // No exception here
-      LOGGER.error (sLogPrefix +
-                    "Error creating the new SMP Service Group for participant '" +
-                    aParticipantID.getURIEncoded () +
-                    "'.",
-                    aCaughtEx);
-    }
+      try
+      {
+        // Do not allow any Extension here
+        // Do NOT create in SMK/SML
+        final String sExtension = null;
+        final SGCustomPropertyList aCustomProperties = null;
+        final boolean bCreateInSML = false;
+        aSG = aServiceGroupMgr.createSMPServiceGroup (aOwningUser.getID (),
+                                                      aParticipantID,
+                                                      sExtension,
+                                                      aCustomProperties,
+                                                      bCreateInSML);
+      }
+      catch (final Exception ex)
+      {
+        aCaughtEx = ex;
+      }
 
-    if (bFromThisSMP)
-      aParticipantMigrationMgr.setParticipantMigrationState (aOutboundMigration.getID (),
-                                                             EParticipantMigrationState.MIGRATED);
+      if (aSG != null)
+      {
+        LOGGER.info (sLogPrefix +
+                     "The new SMP Service Group for participant '" +
+                     aParticipantID.getURIEncoded () +
+                     "' was successfully created.");
+      }
+      else
+      {
+        // No exception here
+        LOGGER.error (sLogPrefix +
+                      "Error creating the new SMP Service Group for participant '" +
+                      aParticipantID.getURIEncoded () +
+                      "'.",
+                      aCaughtEx);
+      }
+    }
 
     // Remember internally
     final ISMPParticipantMigration aMigration = aParticipantMigrationMgr.createInboundParticipantMigration (aParticipantID,
@@ -222,6 +237,31 @@ public final class APIExecutorMigrationInboundFromPathPut extends AbstractSMPAPI
                     "Failed to store the participant migration for '" +
                     aParticipantID.getURIEncoded () +
                     "'.");
+    }
+
+    if (sOutboundMigrationID != null)
+    {
+      // Special case - existing migration from this SMP to this SMP
+      // Also immediately close the outbound migration
+      if (aParticipantMigrationMgr.setParticipantMigrationState (sOutboundMigrationID,
+                                                                 EParticipantMigrationState.MIGRATED).isChanged ())
+      {
+        LOGGER.info (sLogPrefix +
+                     "The outbound Participant Migration with ID '" +
+                     sOutboundMigrationID +
+                     "' for '" +
+                     aParticipantID.getURIEncoded () +
+                     "' was successfully finalized!");
+      }
+      else
+      {
+        LOGGER.error (sLogPrefix +
+                      "Failed to finalize the outbound Participant Migration with ID '" +
+                      sOutboundMigrationID +
+                      "' for '" +
+                      aParticipantID.getURIEncoded () +
+                      "'.");
+      }
     }
 
     final IMicroDocument aResponseDoc = new MicroDocument ();
